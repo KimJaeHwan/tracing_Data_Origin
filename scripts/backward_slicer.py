@@ -17,8 +17,8 @@ from ghidra.util.task import ConsoleTaskMonitor
 # CONFIG
 # ---------------------------------------------------------------------------
 
-ANCHOR_ADDRESS  = 0x18190c492
-ANCHOR_ARG_IDX  = 2
+ANCHOR_ADDRESS  = 0x180410e26
+ANCHOR_ARG_IDX  = 1
 
 try:
     _script_dir = os.path.dirname(os.path.abspath(str(getSourceFile())))
@@ -26,8 +26,8 @@ except Exception:
     _script_dir = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.normpath(os.path.join(_script_dir, "..", "output"))
 
-MAX_DEPTH         = 200
-MAX_CALL_DEPTH    = 10   # interprocedural recursion limit
+MAX_DEPTH            = 200
+MAX_CALL_STACK_DEPTH = 10   # max function boundaries crossed going upward (like backtrace depth)
 
 # Functions whose parameters are external I/O origins - stop and tag as source
 STOP_FUNCTIONS = {
@@ -41,6 +41,8 @@ SKIP_FUNCTIONS = {
     "il2cpp_gc_alloc", "il2cpp_alloc",
     "il2cpp_object_new", "il2cpp_array_new",
     "il2cpp_runtime_invoke",
+    "il2cpp_codegen_initialize_runtime_metadata",
+    "il2cpp_codegen_initialize_runtime_metadata_inline",
     "GC_malloc", "GC_malloc_atomic",
     "memcpy", "memmove", "memset",
 }
@@ -138,22 +140,25 @@ def get_high_function(func):
 # locate the matching argument varnode at each call, and continue slicing.
 # ---------------------------------------------------------------------------
 
-def interprocedural_step(vn, containing_func, param_slot, depth, call_depth):
-    if call_depth >= MAX_CALL_DEPTH:
-        sources.append({
-            "varnode":    vn_str(vn),
-            "is_reg":     vn.isRegister(),
-            "is_stack":   is_stack(vn),
-            "depth":      depth,
-            "note":       "interprocedural depth limit reached",
-        })
-        return
-
+def interprocedural_step(vn, containing_func, param_slot, depth, path_funcs=None, call_stack_depth=0):
+    # path_funcs: set of function entry offsets on the current handle_indirect path.
+    # Non-empty means we entered containing_func via handle_indirect, so only follow
+    # callers that are already on that path (avoids XREF fanout from generic callees).
     callee_name = func_name(containing_func)
     callee_entry = containing_func.getEntryPoint()
 
-    log("[INTERPROC] tracing param slot %d of %s (depth=%d, call_depth=%d)"
-        % (param_slot, callee_name, depth, call_depth))
+    if call_stack_depth >= MAX_CALL_STACK_DEPTH:
+        sources.append({
+            "varnode":  vn_str(vn),
+            "is_reg":   vn.isRegister(),
+            "is_stack": is_stack(vn),
+            "depth":    depth,
+            "note":     "call stack depth limit (%d) reached in %s param[%d]" % (MAX_CALL_STACK_DEPTH, callee_name, param_slot),
+        })
+        return
+
+    log("[INTERPROC] tracing param slot %d of %s (depth=%d, call_stack=%d, path_restricted=%s)"
+        % (param_slot, callee_name, depth, call_stack_depth, path_funcs is not None and len(path_funcs) > 0))
 
     ref_mgr = currentProgram.getReferenceManager()
     xrefs   = list(ref_mgr.getReferencesTo(callee_entry))
@@ -170,22 +175,25 @@ def interprocedural_step(vn, containing_func, param_slot, depth, call_depth):
         })
         return
 
-    # param_slot is 0-based among formal parameters;
-    # CALL op inputs: in[0]=fn_ptr, in[1]=arg0, in[2]=arg1, ...
     call_arg_idx = param_slot + 1
 
     for ref in call_refs:
         call_site = ref.getFromAddress()
         caller_func = currentProgram.getFunctionManager().getFunctionContaining(call_site)
         if caller_func is None:
-            log("[INTERPROC] no function contains call site 0x%x" % call_site.getOffset())
             continue
 
         caller_name = func_name(caller_func)
 
         if caller_name in SKIP_FUNCTIONS:
-            log("[INTERPROC] skipping %s (SKIP_FUNCTIONS)" % caller_name)
             continue
+
+        # path restriction: only follow callers on the handle_indirect path
+        if path_funcs:
+            caller_entry_off = caller_func.getEntryPoint().getOffset()
+            if caller_entry_off not in path_funcs:
+                log("[INTERPROC] skip %s (not on path)" % caller_name)
+                continue
 
         high = get_high_function(caller_func)
         if high is None:
@@ -204,8 +212,6 @@ def interprocedural_step(vn, containing_func, param_slot, depth, call_depth):
 
         inputs = list(call_op.getInputs())
         if call_arg_idx >= len(inputs):
-            log("[INTERPROC] call at 0x%x: arg idx %d out of range (max %d)"
-                % (call_site.getOffset(), call_arg_idx, len(inputs) - 1))
             continue
 
         arg_vn = inputs[call_arg_idx]
@@ -221,7 +227,9 @@ def interprocedural_step(vn, containing_func, param_slot, depth, call_depth):
             "note":    "cross-function: %s -> %s param[%d]" % (caller_name, callee_name, param_slot),
         })
 
-        backward_slice_impl(arg_vn, caller_func, depth + 1, call_depth + 1)
+        # path_funcs is not propagated upward: once we're back in a known-path
+        # function, normal (unrestricted) tracing resumes
+        backward_slice_impl(arg_vn, caller_func, depth + 1, call_stack_depth=call_stack_depth + 1)
 
 # ---------------------------------------------------------------------------
 # INDIRECT HANDLER
@@ -316,6 +324,83 @@ def _collect_ptr_derived(callee_high, seed_keys):
                         break
     return reachable
 
+def find_stores_to_stack_addr(ptrsub_op, containing_func):
+    """
+    Given PTRSUB(RSP, offset) op, find all non-stack values that ultimately
+    flow into that stack location, following stack-to-stack copies recursively.
+    """
+    off_vn = ptrsub_op.getInput(1)
+    if not off_vn.isConstant():
+        return []
+
+    stack_off = off_vn.getOffset()
+    if stack_off > 0x7FFFFFFFFFFFFFFF:
+        stack_off -= 0x10000000000000000
+
+    high = get_high_function(containing_func)
+    if high is None:
+        return []
+
+    return _trace_stack_offset(high, stack_off, set(), set())
+
+
+def _trace_stack_offset(high, stack_off, seen_vals, seen_offs):
+    """
+    Recursively collect non-stack varnodes that flow into stack_off.
+    seen_offs prevents infinite loops on circular stack copies.
+    seen_vals deduplicates results by (addr, offset, size).
+    """
+    if stack_off in seen_offs:
+        return []
+    seen_offs.add(stack_off)
+
+    result = []
+
+    for op in high.getPcodeOps():
+        opc = op.getOpcode()
+
+        # Case 1: STORE [ptr], val  where ptr -> stack_off
+        if opc == PcodeOp.STORE:
+            ptr_vn = op.getInput(1)
+            if _vn_points_to_stack_offset(ptr_vn, stack_off):
+                val_vn = op.getInput(2)
+                if not val_vn.isConstant():
+                    _add_stack_source(high, val_vn, result, seen_vals, seen_offs)
+            continue
+
+        # Case 2: direct SSA stack varnode assignment
+        out = op.getOutput()
+        if out is None or not is_stack(out):
+            continue
+        off = out.getOffset()
+        if off > 0x7FFFFFFFFFFFFFFF:
+            off -= 0x10000000000000000
+        if off != stack_off:
+            continue
+        for inp in op.getInputs():
+            if not inp.isConstant():
+                _add_stack_source(high, inp, result, seen_vals, seen_offs)
+
+    return result
+
+
+def _add_stack_source(high, vn, result, seen_vals, seen_offs):
+    """
+    If vn is a stack varnode, recurse into it.
+    Otherwise add it to result (deduped by seen_vals).
+    """
+    if is_stack(vn):
+        sub_off = vn.getOffset()
+        if sub_off > 0x7FFFFFFFFFFFFFFF:
+            sub_off -= 0x10000000000000000
+        sub = _trace_stack_offset(high, sub_off, seen_vals, seen_offs)
+        result.extend(sub)
+    else:
+        k = (str(vn.getAddress()), vn.getOffset(), vn.getSize())
+        if k not in seen_vals:
+            seen_vals.add(k)
+            result.append(vn)
+
 def _find_output_param_stores(callee_high, param_slot):
     """Return list of value-varnodes STOREd through callee's param[param_slot] pointer."""
     local_map = callee_high.getLocalSymbolMap()
@@ -326,9 +411,11 @@ def _find_output_param_stores(callee_high, param_slot):
         return []
 
     seed_keys = set()
-    for inst in param_sym.getInstances():
-        for pv in inst.getVarnodes():
-            seed_keys.add((str(pv.getAddress()), pv.getOffset(), pv.getSize()))
+    high_var = param_sym.getHighVariable()
+    if high_var is None:
+        return []
+    for pv in high_var.getInstances():
+        seed_keys.add((str(pv.getAddress()), pv.getOffset(), pv.getSize()))
 
     reachable = _collect_ptr_derived(callee_high, seed_keys)
 
@@ -342,15 +429,57 @@ def _find_output_param_stores(callee_high, param_slot):
                 stored.append(op.getInput(2))
     return stored
 
-def handle_indirect(def_op, output_vn, containing_func, depth, call_depth):
+def _vn_is_addr_of_global(ptr_vn, target_vn):
+    """
+    Return True if ptr_vn represents the address of a global/heap varnode.
+    i.e., ptr_vn is a constant whose value equals target_vn's offset in RAM.
+    """
+    try:
+        if target_vn.getAddress().getAddressSpace().getName() not in ("ram", "DATA"):
+            return False
+    except Exception:
+        return False
+    target_offset = target_vn.getOffset()
+    seen = set()
+    worklist = [ptr_vn]
+    while worklist:
+        vn = worklist.pop()
+        if vn is None:
+            continue
+        if vn.isConstant():
+            if vn.getOffset() == target_offset:
+                return True
+            continue
+        k = (str(vn.getAddress()), vn.getOffset(), vn.getSize())
+        if k in seen:
+            continue
+        seen.add(k)
+        d = vn.getDef()
+        if d is None:
+            continue
+        opc = d.getOpcode()
+        if opc in (PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT):
+            worklist.append(d.getInput(0))
+        elif opc == PcodeOp.MULTIEQUAL:
+            for inp in d.getInputs():
+                worklist.append(inp)
+    return False
+
+
+def handle_indirect(def_op, output_vn, containing_func, depth, path_funcs=None, call_stack_depth=0):
     """
     Follow an INDIRECT op into the callee that wrote to output_vn.
+    Handles both stack variables and heap/global objects.
     Returns True if the callee was successfully entered, False to fall back.
+    path_funcs: propagated from caller context (None at top level).
     """
-    if call_depth >= MAX_CALL_DEPTH:
-        return False
-    if not is_stack(output_vn):
-        return False
+    if is_stack(output_vn):
+        return _handle_indirect_stack(def_op, output_vn, containing_func, depth, path_funcs, call_stack_depth)
+    else:
+        return _handle_indirect_heap(def_op, output_vn, containing_func, depth, path_funcs, call_stack_depth)
+
+
+def _handle_indirect_stack(def_op, output_vn, containing_func, depth, path_funcs, call_stack_depth):
 
     high = get_high_function(containing_func)
     if high is None:
@@ -435,10 +564,106 @@ def handle_indirect(def_op, output_vn, containing_func, depth, call_depth):
         })
         return True
 
+    # path_funcs: containing_func (the one with INDIRECT) + callee_func (we're entering)
+    # interprocedural_step inside callee will only follow callers in this set,
+    # preventing XREF fanout through unrelated callers of generic methods
+    new_path = frozenset([
+        containing_func.getEntryPoint().getOffset(),
+        callee_func.getEntryPoint().getOffset(),
+    ])
     for stored_vn in stores:
-        backward_slice_impl(stored_vn, callee_func, depth + 1, call_depth + 1)
+        # handle_indirect goes DOWN into callee - call_stack_depth does not increase
+        backward_slice_impl(stored_vn, callee_func, depth + 1, path_funcs=new_path, call_stack_depth=call_stack_depth)
 
     return True
+
+
+def _handle_indirect_heap(def_op, output_vn, containing_func, depth, path_funcs, call_stack_depth):
+    """
+    Handle INDIRECT op for heap/global objects.
+    Finds which CALL argument is a pointer TO output_vn's global address,
+    enters the callee, and traces STORE ops through that parameter.
+    """
+    if call_stack_depth >= MAX_CALL_STACK_DEPTH:
+        return False
+
+    high = get_high_function(containing_func)
+    if high is None:
+        return False
+
+    call_op = _find_iop_call(def_op, high)
+    if call_op is None:
+        return False
+
+    callee_func = _get_callee_func(call_op)
+    if callee_func is None:
+        return False
+
+    callee_name = func_name(callee_func)
+
+    if callee_name in STOP_FUNCTIONS:
+        sources.append({
+            "varnode":  vn_str(output_vn),
+            "is_reg":   False,
+            "is_stack": False,
+            "depth":    depth,
+            "note":     "[EXTERNAL SOURCE] %s (heap output param)" % callee_name,
+        })
+        return True
+
+    if callee_name in SKIP_FUNCTIONS:
+        return False
+
+    # Find which CALL input is a pointer to output_vn's global address
+    inputs = list(call_op.getInputs())
+    ptr_arg_idx = -1
+    for i in range(1, len(inputs)):
+        if _vn_is_addr_of_global(inputs[i], output_vn):
+            ptr_arg_idx = i
+            break
+
+    if ptr_arg_idx < 0:
+        log("[INDIRECT-HEAP] could not match ptr arg for %s @%s"
+            % (callee_name, vn_str(output_vn)))
+        return False
+
+    param_slot = ptr_arg_idx - 1
+    callee_high = get_high_function(callee_func)
+    if callee_high is None:
+        return False
+
+    stores = _find_output_param_stores(callee_high, param_slot)
+    log("[INDIRECT-HEAP] %s param[%d] -> %d store(s) found"
+        % (callee_name, param_slot, len(stores)))
+
+    chain.append({
+        "address": op_addr_str(def_op),
+        "op":      "INDIRECT->CALL",
+        "output":  vn_str(output_vn),
+        "inputs":  [callee_name],
+        "depth":   depth,
+        "note":    "heap output param[%d] written by %s (%d stores)" % (param_slot, callee_name, len(stores)),
+    })
+
+    if not stores:
+        sources.append({
+            "varnode":  vn_str(output_vn),
+            "is_reg":   False,
+            "is_stack": False,
+            "depth":    depth,
+            "note":     "no STORE found in %s param[%d]" % (callee_name, param_slot),
+        })
+        return True
+
+    new_path = frozenset([
+        containing_func.getEntryPoint().getOffset(),
+        callee_func.getEntryPoint().getOffset(),
+    ])
+    for stored_vn in stores:
+        backward_slice_impl(stored_vn, callee_func, depth + 1,
+                           path_funcs=new_path, call_stack_depth=call_stack_depth)
+    return True
+
 
 # ---------------------------------------------------------------------------
 # PARAM SLOT RESOLUTION
@@ -449,19 +674,33 @@ def handle_indirect(def_op, output_vn, containing_func, depth, call_depth):
 # ---------------------------------------------------------------------------
 
 def resolve_param_slot(vn, high):
-    # HighFunction exposes the HighSymbol for each parameter
+    # Match by SSA identity (hashCode) first - exact same varnode object.
+    # This prevents false matches where multiple SSA versions of the same
+    # physical register (e.g. RCX_v1=param, RCX_v2=local copy) share the
+    # same (address, offset, size) but are different SSA nodes.
     local_sym_map = high.getLocalSymbolMap()
     if local_sym_map is None:
         return -1
+
+    try:
+        target_hash = vn.hashCode()
+    except Exception:
+        target_hash = None
 
     num_params = local_sym_map.getNumParams()
     for i in range(num_params):
         param_sym = local_sym_map.getParamSymbol(i)
         if param_sym is None:
             continue
-        # Each HighSymbol has one or more varnodes
-        for rep in param_sym.getInstances():
-            for pv in rep.getVarnodes():
+        high_var = param_sym.getHighVariable()
+        if high_var is None:
+            continue
+        for pv in high_var.getInstances():
+            if target_hash is not None:
+                if pv.hashCode() == target_hash:
+                    return i
+            else:
+                # fallback: position-based match
                 if (pv.getAddress() == vn.getAddress() and
                         pv.getOffset() == vn.getOffset() and
                         pv.getSize() == vn.getSize()):
@@ -472,7 +711,7 @@ def resolve_param_slot(vn, high):
 # CORE - backward slice (interprocedural-aware)
 # ---------------------------------------------------------------------------
 
-def backward_slice_impl(vn, containing_func, depth, call_depth):
+def backward_slice_impl(vn, containing_func, depth, path_funcs=None, call_stack_depth=0):
     if depth > MAX_DEPTH:
         chain.append({
             "address": "N/A",
@@ -485,8 +724,22 @@ def backward_slice_impl(vn, containing_func, depth, call_depth):
         return
 
     func_entry_hex = "0x%x" % containing_func.getEntryPoint().getOffset()
-    key = (func_entry_hex, str(vn.getAddress()), vn.getOffset(), vn.getSize())
+    # Include SSA-unique identifier (Java hashCode) to distinguish multiple SSA
+    # versions of the same physical location (pre-call vs post-call, loop carries, etc.)
+    try:
+        ssa_id = vn.hashCode()
+    except Exception:
+        ssa_id = id(vn)
+    key = (func_entry_hex, str(vn.getAddress()), vn.getOffset(), vn.getSize(), ssa_id)
     if key in visited:
+        chain.append({
+            "address": "N/A",
+            "op":      "CYCLE",
+            "output":  vn_str(vn),
+            "inputs":  [],
+            "depth":   depth,
+            "note":    "already visited in func@%s" % func_entry_hex,
+        })
         return
     visited.add(key)
 
@@ -513,8 +766,7 @@ def backward_slice_impl(vn, containing_func, depth, call_depth):
             return
 
         if param_slot >= 0:
-            # Recurse into callers
-            interprocedural_step(vn, containing_func, param_slot, depth, call_depth)
+            interprocedural_step(vn, containing_func, param_slot, depth, path_funcs, call_stack_depth)
         else:
             sources.append({
                 "varnode":  vn_str(vn),
@@ -528,9 +780,21 @@ def backward_slice_impl(vn, containing_func, depth, call_depth):
     # INDIRECT: output_vn was written as a side effect of a CALL
     # Try to enter the callee and trace its STORE ops before falling back
     if def_op.getOpcode() == PcodeOp.INDIRECT:
-        if handle_indirect(def_op, vn, containing_func, depth, call_depth):
+        if handle_indirect(def_op, vn, containing_func, depth, path_funcs, call_stack_depth):
             return
-        # Fallback: record op and trace input[0] (pre-call value)
+        # Fallback behavior differs by varnode type:
+        #   Stack  : trace pre-call value (may be meaningful for loop-carry patterns)
+        #   Non-stack: callee couldn't be resolved AND pre-call value = same global
+        #             -> tracing further just loops. Stop and record as source.
+        if not is_stack(vn):
+            sources.append({
+                "varnode":  vn_str(vn),
+                "is_reg":   vn.isRegister(),
+                "is_stack": False,
+                "depth":    depth,
+                "note":     "heap/global INDIRECT - callee not resolved",
+            })
+            return
         inp0 = def_op.getInput(0)
         chain.append({
             "address": op_addr_str(def_op),
@@ -541,7 +805,7 @@ def backward_slice_impl(vn, containing_func, depth, call_depth):
             "note":    "callee not resolved - tracing pre-call value",
         })
         if not inp0.isConstant():
-            backward_slice_impl(inp0, containing_func, depth + 1, call_depth)
+            backward_slice_impl(inp0, containing_func, depth + 1, path_funcs, call_stack_depth)
         return
 
     inp_strs = [vn_str(i) for i in def_op.getInputs()]
@@ -554,13 +818,61 @@ def backward_slice_impl(vn, containing_func, depth, call_depth):
         "note":    "",
     })
 
-    for inp in def_op.getInputs():
+    # For CALL/CALLIND, in[0] is the callee/function pointer (structural, not data).
+    # Skip it to avoid tracing irrelevant function pointer globals.
+    opc = def_op.getOpcode()
+    inputs_to_trace = def_op.getInputs()
+    if opc == PcodeOp.CALL or opc == PcodeOp.CALLIND:
+        inputs_to_trace = list(inputs_to_trace)[1:]
+
+    for inp in inputs_to_trace:
         if not inp.isConstant():
-            backward_slice_impl(inp, containing_func, depth + 1, call_depth)
+            backward_slice_impl(inp, containing_func, depth + 1, path_funcs, call_stack_depth)
+
+    # Stack STORE tracking:
+    # PTRSUB(RSP, offset) computes &stack_var.
+    # Find what was written to that stack location (STORE or direct SSA assignment).
+    if def_op.getOpcode() == PcodeOp.PTRSUB:
+        base_vn = def_op.getInput(0)
+        if base_vn.getDef() is None and base_vn.isRegister():
+            reg = currentProgram.getLanguage().getRegister(
+                base_vn.getAddress(), base_vn.getSize())
+            if reg is not None and reg.getName() == "RSP":
+                stores = find_stores_to_stack_addr(def_op, containing_func)
+                if stores:
+                    log("[STACK-STORE] %d source(s) at %s in %s"
+                        % (len(stores), vn_str(vn), func_name(containing_func)))
+                    for stored_vn in stores:
+                        if not stored_vn.isConstant():
+                            backward_slice_impl(stored_vn, containing_func, depth + 1, path_funcs, call_stack_depth)
+
+    # MULTIEQUAL loop-carry check:
+    # If MULTIEQUAL's inputs are all already visited (self-referential loop),
+    # the varnode may be a parameter whose def was never reached interprocedurally.
+    if def_op.getOpcode() == PcodeOp.MULTIEQUAL:
+        def _inp_visited(inp):
+            if inp.isConstant():
+                return True
+            try:
+                s = inp.hashCode()
+            except Exception:
+                s = id(inp)
+            return (func_entry_hex, str(inp.getAddress()), inp.getOffset(), inp.getSize(), s) in visited
+        all_inputs_visited = all(_inp_visited(inp) for inp in def_op.getInputs())
+        if all_inputs_visited:
+            high = get_high_function(containing_func)
+            if high is not None:
+                param_slot = resolve_param_slot(vn, high)
+                callee_name = func_name(containing_func)
+                if param_slot >= 0 and callee_name not in STOP_FUNCTIONS:
+                    log("[MULTIEQUAL-LOOP] %s param[%d] detected as loop-carry, tracing interprocedurally"
+                        % (callee_name, param_slot))
+                    interprocedural_step(vn, containing_func, param_slot, depth,
+                                        path_funcs, call_stack_depth)
 
 
 def backward_slice(vn, containing_func):
-    backward_slice_impl(vn, containing_func, 0, 0)
+    backward_slice_impl(vn, containing_func, 0)
 
 # ---------------------------------------------------------------------------
 # ANCHOR FINDER
@@ -690,8 +1002,8 @@ def run():
     log("Backward Slicer (interprocedural)")
     log("  anchor addr : 0x%x" % ANCHOR_ADDRESS)
     log("  anchor arg  : in[%d]" % ANCHOR_ARG_IDX)
-    log("  max depth   : %d" % MAX_DEPTH)
-    log("  max calls   : %d" % MAX_CALL_DEPTH)
+    log("  max depth        : %d" % MAX_DEPTH)
+    log("  max call stack   : %d" % MAX_CALL_STACK_DEPTH)
     log("=" * 50)
 
     anchor, anchor_func = find_anchor()

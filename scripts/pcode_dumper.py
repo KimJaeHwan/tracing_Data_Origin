@@ -5,20 +5,31 @@
 # @toolbar
 # @runtime Jython
 
+import os
 import sys
 from ghidra.app.decompiler import DecompInterface, DecompileOptions
 from ghidra.program.model.pcode import PcodeOp
 from ghidra.util.task import ConsoleTaskMonitor
 
 # ---------------------------------------------------------------------------
-# CONFIG -     (send   )
+# CONFIG
 # ---------------------------------------------------------------------------
-FUNC_ADDR = 0x1803636f6   #     
+FUNC_ADDR = 0x18190c2a0
+
+try:
+    _script_dir = os.path.dirname(os.path.abspath(str(getSourceFile())))
+except Exception:
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.normpath(os.path.join(_script_dir, "..", "output"))
 
 # ---------------------------------------------------------------------------
+
+_out_file = None
 
 def log(msg):
     sys.stdout.write(str(msg) + "\n")
+    if _out_file is not None:
+        _out_file.write((str(msg) + "\n").encode("utf-8"))
 
 def make_addr(offset):
     return currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(offset)
@@ -93,4 +104,14 @@ def run():
         ins = [vn_str(i) for i in op.getInputs()]
         log("  %-12s  out=%-20s  in=%s" % (op_name(op), vn_str(out), ins))
 
-run()
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+out_path = os.path.join(OUTPUT_DIR, "pcode_dump_0x%x.txt" % FUNC_ADDR)
+_out_file = open(out_path, "wb")
+try:
+    run()
+finally:
+    _out_file.close()
+
+sys.stdout.write("[OUT] pcode dump -> %s\n" % out_path)
