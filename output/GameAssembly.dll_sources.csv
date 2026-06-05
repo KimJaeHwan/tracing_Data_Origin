@@ -1,0 +1,11 @@
+depth,varnode,is_reg,is_stack,note
+18,mem@ram+0x182f48238,False,False,heap/global INDIRECT - callee not resolved
+18,mem@ram+0x182f48238,False,False,heap/global INDIRECT - callee not resolved
+18,mem@ram+0x182f48238,False,False,heap/global INDIRECT - callee not resolved
+18,mem@ram+0x182f48238,False,False,heap/global INDIRECT - callee not resolved
+18,mem@ram+0x182f48238,False,False,
+18,mem@ram+0x182f48238,False,False,heap/global INDIRECT - callee not resolved
+11,RCX,True,False,no callers - root source in ClientSocket_Update_mDAF01584BB8BCA1D792E10CD8DE6AFEDBB09F54A param[0]
+8,mem@ram+0x182f3c928,False,False,
+8,mem@ram+0x182f3c928,False,False,heap/global INDIRECT - callee not resolved
+7,mem@ram+0x182f3c928,False,False,heap/global INDIRECT - callee not resolved
