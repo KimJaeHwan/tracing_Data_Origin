@@ -20,7 +20,11 @@ from ghidra.util.task import ConsoleTaskMonitor
 ANCHOR_ADDRESS  = 0x18190c492
 ANCHOR_ARG_IDX  = 2
 
-OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "ghidra_slicer_output")
+try:
+    _script_dir = os.path.dirname(os.path.abspath(str(getSourceFile())))
+except Exception:
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.normpath(os.path.join(_script_dir, "..", "output"))
 
 MAX_DEPTH         = 200
 MAX_CALL_DEPTH    = 10   # interprocedural recursion limit
@@ -220,6 +224,223 @@ def interprocedural_step(vn, containing_func, param_slot, depth, call_depth):
         backward_slice_impl(arg_vn, caller_func, depth + 1, call_depth + 1)
 
 # ---------------------------------------------------------------------------
+# INDIRECT HANDLER
+#
+# INDIRECT op means: output_vn was modified as a side effect of a CALL.
+# Strategy:
+#   1. Find the causing CALL op at the same address.
+#   2. Identify which argument is the pointer to output_vn (stack offset match).
+#   3. Decompile the callee; find all STORE ops through that parameter pointer.
+#   4. Trace each stored value backward.
+# ---------------------------------------------------------------------------
+
+def _find_iop_call(def_op, high):
+    addr = def_op.getSeqnum().getTarget()
+    for op in high.getPcodeOps(addr):
+        if op.getOpcode() == PcodeOp.CALL or op.getOpcode() == PcodeOp.CALLIND:
+            return op
+    return None
+
+def _get_callee_func(call_op):
+    if call_op.getOpcode() != PcodeOp.CALL:
+        return None
+    try:
+        callee_addr = call_op.getInput(0).getAddress()
+        return currentProgram.getFunctionManager().getFunctionAt(callee_addr)
+    except Exception:
+        return None
+
+def _vn_points_to_stack_offset(ptr_vn, target_off):
+    """Return True if ptr_vn's def chain computes a pointer to stack offset target_off."""
+    seen = set()
+    worklist = [ptr_vn]
+    while worklist:
+        vn = worklist.pop()
+        if vn is None or vn.isConstant():
+            continue
+        k = (str(vn.getAddress()), vn.getOffset(), vn.getSize())
+        if k in seen:
+            continue
+        seen.add(k)
+        d = vn.getDef()
+        if d is None:
+            continue
+        opc = d.getOpcode()
+        if opc == PcodeOp.PTRSUB or opc == PcodeOp.PTRADD:
+            c = d.getInput(1)
+            if c.isConstant():
+                off = c.getOffset()
+                if off > 0x7FFFFFFFFFFFFFFF:
+                    off = off - 0x10000000000000000
+                if off == target_off:
+                    return True
+            worklist.append(d.getInput(0))
+        elif opc in (PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT):
+            worklist.append(d.getInput(0))
+        elif opc == PcodeOp.MULTIEQUAL:
+            for inp in d.getInputs():
+                worklist.append(inp)
+        elif opc == PcodeOp.INT_ADD:
+            c = d.getInput(1)
+            if c.isConstant():
+                off = c.getOffset()
+                if off > 0x7FFFFFFFFFFFFFFF:
+                    off = off - 0x10000000000000000
+                if off == target_off:
+                    return True
+            worklist.append(d.getInput(0))
+            worklist.append(d.getInput(1))
+    return False
+
+def _collect_ptr_derived(callee_high, seed_keys):
+    """Forward-propagate seed_keys through copy/cast/ptr ops; return reachable key set."""
+    reachable = set(seed_keys)
+    changed = True
+    while changed:
+        changed = False
+        for op in callee_high.getPcodeOps():
+            out = op.getOutput()
+            if out is None:
+                continue
+            out_k = (str(out.getAddress()), out.getOffset(), out.getSize())
+            if out_k in reachable:
+                continue
+            opc = op.getOpcode()
+            if opc in (PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT,
+                       PcodeOp.PTRSUB, PcodeOp.PTRADD, PcodeOp.INT_ADD, PcodeOp.MULTIEQUAL):
+                for inp in op.getInputs():
+                    k = (str(inp.getAddress()), inp.getOffset(), inp.getSize())
+                    if k in reachable:
+                        reachable.add(out_k)
+                        changed = True
+                        break
+    return reachable
+
+def _find_output_param_stores(callee_high, param_slot):
+    """Return list of value-varnodes STOREd through callee's param[param_slot] pointer."""
+    local_map = callee_high.getLocalSymbolMap()
+    if local_map is None or param_slot >= local_map.getNumParams():
+        return []
+    param_sym = local_map.getParamSymbol(param_slot)
+    if param_sym is None:
+        return []
+
+    seed_keys = set()
+    for inst in param_sym.getInstances():
+        for pv in inst.getVarnodes():
+            seed_keys.add((str(pv.getAddress()), pv.getOffset(), pv.getSize()))
+
+    reachable = _collect_ptr_derived(callee_high, seed_keys)
+
+    stored = []
+    for op in callee_high.getPcodeOps():
+        if op.getOpcode() == PcodeOp.STORE:
+            # STORE: in[0]=addrspace, in[1]=pointer, in[2]=value
+            ptr_vn = op.getInput(1)
+            k = (str(ptr_vn.getAddress()), ptr_vn.getOffset(), ptr_vn.getSize())
+            if k in reachable:
+                stored.append(op.getInput(2))
+    return stored
+
+def handle_indirect(def_op, output_vn, containing_func, depth, call_depth):
+    """
+    Follow an INDIRECT op into the callee that wrote to output_vn.
+    Returns True if the callee was successfully entered, False to fall back.
+    """
+    if call_depth >= MAX_CALL_DEPTH:
+        return False
+    if not is_stack(output_vn):
+        return False
+
+    high = get_high_function(containing_func)
+    if high is None:
+        return False
+
+    call_op = _find_iop_call(def_op, high)
+    if call_op is None:
+        return False
+
+    callee_func = _get_callee_func(call_op)
+    if callee_func is None:
+        return False
+
+    callee_name = func_name(callee_func)
+
+    if callee_name in STOP_FUNCTIONS:
+        sources.append({
+            "varnode":  vn_str(output_vn),
+            "is_reg":   False,
+            "is_stack": True,
+            "depth":    depth,
+            "note":     "[EXTERNAL SOURCE] %s (output param)" % callee_name,
+        })
+        return True
+
+    if callee_name in SKIP_FUNCTIONS:
+        return False
+
+    # Match CALL arg to output_vn by stack offset
+    target_off = output_vn.getOffset()
+    if target_off > 0x7FFFFFFFFFFFFFFF:
+        target_off = target_off - 0x10000000000000000
+
+    inputs = list(call_op.getInputs())
+    ptr_arg_idx = -1
+    for i in range(1, len(inputs)):
+        if _vn_points_to_stack_offset(inputs[i], target_off):
+            ptr_arg_idx = i
+            break
+
+    if ptr_arg_idx < 0:
+        log("[INDIRECT] could not match ptr arg for %s stack:0x%x - trying all pointer args"
+            % (callee_name, target_off))
+        # Fallback: try param slots one by one and pick first that has stores
+        callee_high = get_high_function(callee_func)
+        if callee_high is None:
+            return False
+        local_map = callee_high.getLocalSymbolMap()
+        num = local_map.getNumParams() if local_map else 0
+        for slot in range(num):
+            stores = _find_output_param_stores(callee_high, slot)
+            if stores:
+                ptr_arg_idx = slot + 1
+                break
+        if ptr_arg_idx < 0:
+            return False
+
+    param_slot = ptr_arg_idx - 1
+    callee_high = get_high_function(callee_func)
+    if callee_high is None:
+        return False
+
+    stores = _find_output_param_stores(callee_high, param_slot)
+    log("[INDIRECT] %s param[%d] -> %d store(s) found" % (callee_name, param_slot, len(stores)))
+
+    chain.append({
+        "address": op_addr_str(def_op),
+        "op":      "INDIRECT->CALL",
+        "output":  vn_str(output_vn),
+        "inputs":  [callee_name],
+        "depth":   depth,
+        "note":    "output param[%d] written by %s (%d stores)" % (param_slot, callee_name, len(stores)),
+    })
+
+    if not stores:
+        sources.append({
+            "varnode":  vn_str(output_vn),
+            "is_reg":   False,
+            "is_stack": True,
+            "depth":    depth,
+            "note":     "no STORE found in %s param[%d]" % (callee_name, param_slot),
+        })
+        return True
+
+    for stored_vn in stores:
+        backward_slice_impl(stored_vn, callee_func, depth + 1, call_depth + 1)
+
+    return True
+
+# ---------------------------------------------------------------------------
 # PARAM SLOT RESOLUTION
 #
 # Given a varnode that has no def-op in a HighFunction, determine if it is
@@ -302,6 +523,25 @@ def backward_slice_impl(vn, containing_func, depth, call_depth):
                 "depth":    depth,
                 "note":     "",
             })
+        return
+
+    # INDIRECT: output_vn was written as a side effect of a CALL
+    # Try to enter the callee and trace its STORE ops before falling back
+    if def_op.getOpcode() == PcodeOp.INDIRECT:
+        if handle_indirect(def_op, vn, containing_func, depth, call_depth):
+            return
+        # Fallback: record op and trace input[0] (pre-call value)
+        inp0 = def_op.getInput(0)
+        chain.append({
+            "address": op_addr_str(def_op),
+            "op":      "INDIRECT(fallback)",
+            "output":  vn_str(def_op.getOutput()),
+            "inputs":  [vn_str(def_op.getInput(0))],
+            "depth":   depth,
+            "note":    "callee not resolved - tracing pre-call value",
+        })
+        if not inp0.isConstant():
+            backward_slice_impl(inp0, containing_func, depth + 1, call_depth)
         return
 
     inp_strs = [vn_str(i) for i in def_op.getInputs()]
