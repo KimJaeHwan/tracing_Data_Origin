@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(New-Item -ItemType Directory -Force \"D:\\\\01_gitproject\\\\08_tracing_Data_Origin\\\\scripts\")",
+      "Bash(Out-Null)",
+      "Bash(New-Item -ItemType Directory -Force \"D:\\\\01_gitproject\\\\08_tracing_Data_Origin\\\\output\")",
+      "Bash(Copy-Item \"C:\\\\Users\\\\rfkjh22\\\\Downloads\\\\files\\\\backward_slicer.py\" \"D:\\\\01_gitproject\\\\08_tracing_Data_Origin\\\\scripts\\\\backward_slicer.py\")",
+      "Bash(Copy-Item \"C:\\\\Users\\\\rfkjh22\\\\Downloads\\\\files\\\\pcode_dumper.py\"    \"D:\\\\01_gitproject\\\\08_tracing_Data_Origin\\\\scripts\\\\pcode_dumper.py\")",
+      "Bash(Write-Host \"done\")",
+      "Bash(powershell -Command ' *)"
+    ]
+  }
+}
