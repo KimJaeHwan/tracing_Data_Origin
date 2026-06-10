@@ -2,7 +2,7 @@
 
 ## 개요
 
-`backward_slicer.py`(현재 버전)를 DataFlowBench 55개 케이스에 대해
+`backward_slicer.py`(현재 버전)를 DataFlowBench 60개 케이스에 대해
 코드 정적 분석으로 평가한 결과다. 실제 바이너리 실행 없이 슬라이서의
 PCode 처리 로직과 각 케이스의 데이터 흐름 패턴을 대조하여 판정했다.
 
@@ -37,6 +37,9 @@ PCode 처리 로직과 각 케이스의 데이터 흐름 패턴을 대조하여 
 | context-insensitive interprocedural (XREF 전체 탐색) | 다중 callsite 공유 함수 |
 | setjmp / longjmp / C++ exception 미지원 | 비정상 흐름 |
 | 스레드 간 데이터 흐름 미지원 | 멀티스레드 패턴 |
+| 힙 base varnode 기반 raw 오프셋 추적 미구현 (RSP-relative만 지원) | 힙 포인터 산술 |
+| STORE/LOAD 크기 기반 range 교집합 분석 미구현 | 타입 캐스트 오버랩, 부분 write |
+| 비트필드 bit-range 분석 미구현 (SUBPIECE+shift+AND 패턴) | 비트필드 구조체 |
 
 ### 연동 이슈 (테스트베드 전용)
 
@@ -58,7 +61,7 @@ dfbench_adapter 개발 시 `SOURCE_FUNCTIONS` 설정으로 해결 예정.
 
 ---
 
-### dfbench_win_core (50 cases)
+### dfbench_win_core (55 cases)
 
 #### Basic (DFB001 ~ DFB003)
 
@@ -88,12 +91,13 @@ dfbench_adapter 개발 시 `SOURCE_FUNCTIONS` 설정으로 해결 예정.
 | DFB025 | global_field_precise | ⚠️ 불확실 | 글로벌 struct 필드 오프셋 + `_vn_is_addr_of_global` 정확도 의존 |
 | DFB026 | global_interproc_reader | ⚠️ 불확실 | DFB024보다 함수 경계 더 많음 |
 
-#### Heap (DFB030 ~ DFB031)
+#### Heap (DFB030 ~ DFB032)
 
 | ID | 이름 | 판정 | 근거 |
 |---|---|:---:|---|
 | DFB030 | heap_field | ⚠️ 불확실 | malloc 힙 주소를 `_vn_is_addr_of_global`이 매칭하는지 Ghidra 표현 의존 |
 | DFB031 | heap_realloc_preserve | ❌ FAIL | realloc이 포인터 교체 → 이전 힙 주소 무효화, 추적 불가 |
+| DFB032 | heap_raw_offset | ❌ FAIL | `malloc` 반환 varnode + raw INT_ADD/PTRADD 오프셋 산술. `find_stores_to_stack_addr`는 RSP-relative 주소만 처리하며 힙 base varnode 기반 오프셋 매칭 미구현 |
 
 #### Struct / Array (DFB040 ~ DFB046)
 
@@ -106,6 +110,18 @@ dfbench_adapter 개발 시 `SOURCE_FUNCTIONS` 설정으로 해결 예정.
 | DFB044 | array_variable_index | ❌ FAIL | 변수 인덱스 → `_vn_points_to_stack_offset`이 상수 오프셋만 지원, 매칭 실패 |
 | DFB045 | nested_aggregate_field | ⚠️ 불확실 | 중첩 struct 오프셋 누적 계산 — PTRADD 체인을 따라가는지 의존 |
 | DFB046 | partial_overwrite_subfield | ❌ FAIL | 부분 write 후 전체 read — PCode에서 별도 SSA 노드로 분리, 연결 추적 불가 |
+
+#### Offset Arithmetic (DFB034, DFB047 ~ DFB049)
+
+오프셋 단위 추적의 경계 케이스를 검증하는 신규 그룹.
+PTRSUB / INT_ADD / INT_SUB / SUBPIECE PCode 패턴과 슬라이서 한계 지점을 명시한다.
+
+| ID | 이름 | 판정 | 근거 |
+|---|---|:---:|---|
+| DFB034 | bitfield_access | ❌ FAIL | `unsigned flags:4; unsigned value:4` — SUBPIECE+INT_RIGHT+INT_AND 패턴. write 시 read-modify-write 바이트 병합으로 두 소스가 단일 STORE에 섞임. bit-range 분석 없이는 source_A / source_B 분리 불가 |
+| DFB047 | struct_padding_offset | ✅ PASS | `char tag` + 3바이트 패딩 + `int value`. Ghidra decompiler가 ABI-correct 절대 오프셋(+4)을 계산해 PTRSUB에 직접 반영 → 슬라이서는 decompiler 제공 오프셋을 그대로 사용하므로 패딩 인식 불필요 |
+| DFB048 | cast_range_overlap | ❌ FAIL | `*(int*)(buf+4) = src_A` → STORE size=4, offset=4 (covers bytes [4..7]). 읽기는 `buf[6]`(offset=6, size=1). 정확한 추적을 위해 `store_offset ≤ read_offset < store_offset + store_size` range 교집합 검사 필요 → 현재 슬라이서 exact offset 매칭으로 미탐 |
+| DFB049 | negative_offset_arithmetic | ⚠️ 불확실 | `end = buf+30; *(end-10) = src`. 상수 피연산자 → Ghidra 상수 폴딩 시 INT_ADD(buf, 20) 단일 op → PASS. 비폴딩 시 INT_ADD(INT_ADD(buf, 30), -10) — INT_NEGATE/INT_2COMP 결합 필요 → FAIL |
 
 #### Interprocedural (DFB050 ~ DFB060)
 
@@ -188,10 +204,10 @@ dfbench_adapter 개발 시 `SOURCE_FUNCTIONS` 설정으로 해결 예정.
 
 | 판정 | 개수 | 케이스 |
 |---|:---:|---|
-| ✅ PASS | **16** | DFB001~003, DFB010~012, DFB020~022, DFB040, DFB043, DFB050~051, DFB054, DFB056, DFB058, DFB102, DFB200~201 |
-| ⚠️ 불확실 | **19** | DFB023~026, DFB030, DFB041~042, DFB045, DFB052~053, DFB055, DFB057, DFB059~060, DFB073, DFB091, DFB100~101, DFB122, DFB130~131 |
-| ❌ FAIL | **20** | DFB031, DFB044, DFB046, DFB070~072, DFB080~081, DFB090, DFB092, DFB110~111, DFB120~121, DFB123 |
-| **합계** | **55** | |
+| ✅ PASS | **17** | DFB001~003, DFB010~012, DFB020~022, DFB040, DFB043, DFB047, DFB050~051, DFB054, DFB056, DFB058, DFB102, DFB200~201 |
+| ⚠️ 불확실 | **20** | DFB023~026, DFB030, DFB041~042, DFB045, DFB049, DFB052~053, DFB055, DFB057, DFB059~060, DFB073, DFB091, DFB100~101, DFB122, DFB130~131 |
+| ❌ FAIL | **23** | DFB031~032, DFB034, DFB044, DFB046, DFB048, DFB070~072, DFB080~081, DFB090, DFB092, DFB110~111, DFB120~121, DFB123 |
+| **합계** | **60** | |
 
 ---
 
@@ -205,6 +221,9 @@ dfbench_adapter 개발 시 `SOURCE_FUNCTIONS` 설정으로 해결 예정.
 | 변수 인덱스 배열 오프셋 미지원 | 1 | DFB044 |
 | realloc 포인터 교체 | 1 | DFB031 |
 | 부분 구조체 write 의미론 | 1 | DFB046 |
+| 힙 base varnode raw 오프셋 추적 미구현 | 1 | DFB032 |
+| STORE/LOAD range 교집합 분석 미구현 | 1 | DFB048 |
+| 비트필드 bit-range 분석 미구현 | 1 | DFB034 |
 
 ---
 
@@ -224,6 +243,6 @@ dfbench_adapter 개발 시 `SOURCE_FUNCTIONS` 설정으로 해결 예정.
 ## 평가 기준 시점
 
 - 평가 대상: `backward_slicer.py` (08_tracing_Data_Origin, commit `eac4637` 기준)
-- 테스트베드: DataFlowBench v1.0 (09_tdo_testbed, 55 cases)
+- 테스트베드: DataFlowBench v1.0 (09_tdo_testbed, 60 cases — offset arithmetic 그룹 DFB032/034/047~049 추가)
 - 평가 방법: 코드 정적 분석 (Ghidra headless 실행 없음)
 - 실측 검증: `dfbench_adapter.py` 완성 후 진행 예정
