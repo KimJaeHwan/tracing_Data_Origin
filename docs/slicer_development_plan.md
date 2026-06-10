@@ -75,7 +75,7 @@
 | **케이스 단위** | source → sink 전체 경로 | 함수 1개의 input/output 패턴 1가지 |
 | **expected** | `{found_sources: [dfb_source_A, ...]}` | `{call_edges: [...], out_params: [...], return_sources: [...]}` |
 | **graph_builder와의 관계** | 간접 — 경로 정확도가 Node 품질을 보장 | 직접 — Node 내용(I/O 분류)을 직접 검증 |
-| **케이스 수** | 55개 (확정) | 미정 (약 80~100개 예상) |
+| **케이스 수** | 61개 (확정 — offset arithmetic 그룹 DFB032/034~035/047~049 포함) | 미정 (약 80~100개 예상) |
 
 ---
 
@@ -112,11 +112,23 @@ class SliceResult:
     anchor_address : str
     anchor_arg_idx : int
     chain          : list[dict]  # op별 추적 기록
-    sources        : list[dict]  # 종료 지점 목록
+    sources        : list[SourceRecord]  # 종료 지점 목록
     found_sources  : set[str]    # source_functions 중 실제 도달한 함수명
     errors         : list[str]
 
     def to_json(self) -> dict
+
+class SourceRecord:
+    func_name  : str   # 도달한 소스 함수명
+    address    : str   # 소스 CALL 주소
+    confidence : str   # "definite" | "bitfield_approx"
+    reason     : str   # "" | "bitfield_rmw" | "over_approx_xref"
+    #
+    # confidence 분류:
+    #   definite        — varnode 체인으로 직접 연결됨 (High PCode 정상 경로)
+    #   bitfield_approx — INDIRECT bitfield fallback 경유. bit-range 분리 불가.
+    #                     동일 byte의 다른 bit 기여자도 함께 보고될 수 있음.
+    #                     (Phase 8 이전에는 이 confidence로 소스가 등록되지 않음)
 ```
 
 #### 핵심 내부 함수
@@ -126,8 +138,10 @@ class SliceResult:
 - `_handle_indirect(op, func, depth, state)` — INDIRECT op 처리
   - `_handle_indirect_stack()` — 스택 outparam
   - `_handle_indirect_heap()` — 힙/글로벌 outparam
+  - *(Phase 8)* `_handle_indirect_bitfield()` — `CALL out=null + INDIRECT` 패턴 감지 시 Low PCode fallback
 - `_find_stores_to_stack_addr(func, offset, state)` — 스택 주소 STORE 탐색
 - `_resolve_param_slot(vn, func)` — SSA hashCode 기반 파라미터 슬롯 식별
+- *(Phase 8)* `_get_low_pcode_at(addr)` — `instruction.getPcode()` 기반 Low PCode 수집
 
 ---
 
@@ -527,7 +541,18 @@ DFB에 없어서 FIO에서 새로 필요한 패턴:
     }
   ],
   "sources": [
-    {"varnode": "tmp:0:4", "depth": 15, "note": "[EXTERNAL SOURCE] recv"}
+    {
+      "func_name"  : "recv",
+      "address"    : "0x181901234",
+      "confidence" : "definite",
+      "reason"     : ""
+    },
+    {
+      "func_name"  : "dfb_source_A",
+      "address"    : "0x140002c38",
+      "confidence" : "bitfield_approx",
+      "reason"     : "bitfield_rmw — bit-range indistinguishable; co-contributor: dfb_source_B"
+    }
   ]
 }
 ```
@@ -573,9 +598,11 @@ Phase 2  dfbench_adapter.py 작성
          DataFlowBench 50개 케이스 자동 평가
          검증: 예상 PASS 16개 기준으로 엔진 상태 측정
 
-Phase 3  slicer_core.py 1차 개선
+Phase 3  slicer_core.py 1차 개선 (offset 단위 — High PCode 범위 내)
          FAIL/UNCERTAIN 케이스 분석 → 개선 가능한 것부터 수정
          우선순위: DFB024~026(글로벌), DFB040~045(구조체/배열), DFB053/057(sret)
+         범위 제한: 비트필드(DFB034/035) 및 range-overlap(DFB048)은 이 페이즈에서 제외
+                    → Phase 8에서 High/Low PCode 하이브리드로 처리
          목표: PASS 30개 이상
 
 Phase 4  FuncIOBench 테스트베드 구축 (10_fio_testbed)
@@ -594,17 +621,49 @@ Phase 6  graph_builder.py 작성
 Phase 7  analysis_adapter.py + ida_highlight.py 작성
          그래프 탐색 기반 실전 분석 파이프라인 완성
          UNRESOLVED 시 slicer_core runtime fallback
+
+Phase 8  slicer_core 2차 개선 — High/Low PCode 하이브리드
+         대상: High PCode에서 추적 불가한 구조적 패턴
+         ─────────────────────────────────────────────
+         [8-A] INDIRECT bitfield fallback
+               패턴: CALL out=null + INDIRECT (DFB034/035)
+               방법:
+                 1. INDIRECT의 effect_host(const:seqno)로 원인 CALL 식별
+                 2. 해당 instruction 주소의 Low PCode 수집 (instruction.getPcode())
+                 3. Low PCode 내 CALL 반환값(RAX/EAX) varnode 추적
+                    → INT_AND / INT_LEFT 체인으로 bit-range 추출
+                    → callee 식별
+                 4. High PCode interprocedural_step으로 복귀
+               출력: confidence="bitfield_approx", reason="bitfield_rmw"
+               검증: DFB034/035 — 소스 미탐지 → over-approximation PASS 전환
+
+         [8-B] STORE/LOAD range-overlap 분석 (DFB048)
+               패턴: STORE size>1 at offset N, LOAD at offset M (N < M < N+size)
+               방법:
+                 _find_stores_to_stack_addr에 range 교집합 검사 추가:
+                   store_offset <= load_offset < store_offset + store_size
+               출력: confidence="range_approx", reason="range_overlap"
+               검증: DFB048 PASS 전환
+
+         산출물: slicer_core에 _handle_indirect_bitfield(), _get_low_pcode_at() 추가
+                 SliceResult.sources confidence 필드 활성화
+         목표: DFB034/035/048 PASS 전환 (FAIL 24 → 21)
 ```
 
 ### Phase별 slicer_core 품질 목표
 
-| Phase | 목표 | 측정 지표 |
-|---|---|---|
-| Phase 1 | 기존 backward_slicer.py와 동등 | 수동 대조 |
-| Phase 2 | DFB PASS 16개 이상 확인 | dfbench_adapter 결과 |
-| Phase 3 | DFB PASS 30개 이상 | dfbench_adapter 결과 |
-| Phase 5 | FIO PASS 80% 이상 | fiobench_adapter 결과 |
-| Phase 6 | graph_builder UNKNOWN 비율 20% 이하 | coverage 통계 |
+| Phase | 목표 | 측정 지표 | 비고 |
+|---|---|---|---|
+| Phase 1 | 기존 backward_slicer.py와 동등 | 수동 대조 | |
+| Phase 2 | DFB PASS 17개 이상 확인 | dfbench_adapter 결과 | DFB047(struct_padding) 포함 |
+| Phase 3 | DFB PASS 30개 이상 | dfbench_adapter 결과 | offset/global/sret 개선 |
+| Phase 5 | FIO PASS 80% 이상 | fiobench_adapter 결과 | |
+| Phase 6 | graph_builder UNKNOWN 비율 20% 이하 | coverage 통계 | |
+| Phase 8 | DFB FAIL 24→21 (bitfield/range-overlap 3건 해결) | dfbench_adapter 결과 | High/Low PCode 하이브리드 |
+
+> **범위 메모**: DFB034/035(bitfield), DFB048(range-overlap), DFB032(heap raw offset)는
+> Phase 3 개선 대상에서 제외. 각각 Phase 8 (bitfield/range-overlap) 및
+> 추후 힙 추적 전용 개선 작업으로 위치.
 
 ---
 
