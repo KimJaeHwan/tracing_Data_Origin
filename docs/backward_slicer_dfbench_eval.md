@@ -119,22 +119,24 @@ PTRSUB / INT_ADD / INT_SUB / SUBPIECE PCode 패턴과 슬라이서 한계 지점
 | ID | 이름 | 판정 | 근거 |
 |---|---|:---:|---|
 | DFB034 | bitfield_access | ❌ FAIL | **실측 확인.** 비초기화 bp → Ghidra가 `CALL out=null + INDIRECT out=stack:0x-38` 패턴으로 인코딩. source 반환값 varnode가 없고, sink는 undefined stack varnode를 수신. 슬라이서가 INDIRECT의 effect_host(CALL seqno)를 따라가는 로직 없어 소스 전혀 미탐지 |
-| DFB035 | bitfield_access_zeroinit | ⚠️ 불확실 | DFB034와 동일 로직, `bp = {0}` 초기화만 다름. 가설: 초기화로 SSA 체인이 앵커되어 Ghidra가 source 반환값 varnode를 INDIRECT 출력에 연결할 수 있음. **실제 PCode 형태는 pcode_dumper 실행으로 확인 필요** |
+| DFB035 | bitfield_access_zeroinit | ❌ FAIL | **실측 확인.** `bp = {0}` 초기화에도 PCode 구조 동일 — `CALL out=null + INDIRECT out=stack:0x-38`. seqno만 다름(0x12, 0x46). Ghidra의 비트필드 처리 방식이 초기화 여부와 무관하게 고정됨 확인 |
 | DFB047 | struct_padding_offset | ✅ PASS | `char tag` + 3바이트 패딩 + `int value`. Ghidra decompiler가 ABI-correct 절대 오프셋(+4)을 계산해 PTRSUB에 직접 반영 → 슬라이서는 decompiler 제공 오프셋을 그대로 사용하므로 패딩 인식 불필요 |
 | DFB048 | cast_range_overlap | ❌ FAIL | `*(int*)(buf+4) = src_A` → STORE size=4, offset=4 (covers bytes [4..7]). 읽기는 `buf[6]`(offset=6, size=1). 정확한 추적을 위해 `store_offset ≤ read_offset < store_offset + store_size` range 교집합 검사 필요 → 현재 슬라이서 exact offset 매칭으로 미탐 |
 | DFB049 | negative_offset_arithmetic | ⚠️ 불확실 | `end = buf+30; *(end-10) = src`. 상수 피연산자 → Ghidra 상수 폴딩 시 INT_ADD(buf, 20) 단일 op → PASS. 비폴딩 시 INT_ADD(INT_ADD(buf, 30), -10) — INT_NEGATE/INT_2COMP 결합 필요 → FAIL |
 
-**DFB034 실측 PCode (Ghidra, 비초기화):**
+**DFB034/035 실측 PCode 비교 (Ghidra headless, 2026-06-10):**
 ```
-CALL  out=null        in=[dfb_source_A]
-INDIRECT  out=stack:0x-38  in=[stack:0x-38, const:0xf]    ← effect_host=seqno(CALL)
-CALL  out=null        in=[dfb_source_B]
-INDIRECT  out=stack:0x-38  in=[stack:0x-38, const:0x43]
-CALL  out=null        in=[dfb_sink_int, stack:0x-38]
+DFB034 (bp 비초기화):          DFB035 (bp = {0} 초기화):
+CALL  out=null  [dfb_source_A]  CALL  out=null  [dfb_source_A]
+INDIRECT  stack:0x-38  const:0xf    INDIRECT  stack:0x-38  const:0x12
+CALL  out=null  [dfb_source_B]  CALL  out=null  [dfb_source_B]
+INDIRECT  stack:0x-38  const:0x43   INDIRECT  stack:0x-38  const:0x46
+CALL  out=null  [dfb_sink_int, stack:0x-38]    (동일)
 ```
-source 반환값 varnode가 생성되지 않으며, INDIRECT의 `const:seqno`가 원인 CALL을 가리키지만
-현재 슬라이서는 이 effect_host 역참조 로직이 없다.
-**→ 향후 개선 방향**: `INDIRECT` 처리 시 effect_host seqno로 원인 CALL을 찾아 callee를 SOURCE_FUNCTIONS에서 조회하는 경로 추가 (over-approximation으로 양쪽 source 모두 탐지하게 됨)
+→ seqno 값만 다르고 구조 완전 동일. **초기화 여부는 Ghidra High PCode 비트필드 표현에 영향 없음** 확정.
+
+source 반환값 varnode가 생성되지 않으며, INDIRECT의 `const:seqno`가 원인 CALL을 가리킨다.
+**→ 향후 개선 방향**: `INDIRECT` 처리 시 effect_host seqno로 원인 CALL을 찾아 callee를 SOURCE_FUNCTIONS에서 조회하는 경로 추가 (over-approximation으로 양쪽 source 모두 탐지. bit-range 분리는 여전히 불가)
 
 #### Interprocedural (DFB050 ~ DFB060)
 
@@ -218,8 +220,8 @@ source 반환값 varnode가 생성되지 않으며, INDIRECT의 `const:seqno`가
 | 판정 | 개수 | 케이스 |
 |---|:---:|---|
 | ✅ PASS | **17** | DFB001~003, DFB010~012, DFB020~022, DFB040, DFB043, DFB047, DFB050~051, DFB054, DFB056, DFB058, DFB102, DFB200~201 |
-| ⚠️ 불확실 | **21** | DFB023~026, DFB030, DFB035, DFB041~042, DFB045, DFB049, DFB052~053, DFB055, DFB057, DFB059~060, DFB073, DFB091, DFB100~101, DFB122, DFB130~131 |
-| ❌ FAIL | **23** | DFB031~032, DFB034, DFB044, DFB046, DFB048, DFB070~072, DFB080~081, DFB090, DFB092, DFB110~111, DFB120~121, DFB123 |
+| ⚠️ 불확실 | **20** | DFB023~026, DFB030, DFB041~042, DFB045, DFB049, DFB052~053, DFB055, DFB057, DFB059~060, DFB073, DFB091, DFB100~101, DFB122, DFB130~131 |
+| ❌ FAIL | **24** | DFB031~032, DFB034~035, DFB044, DFB046, DFB048, DFB070~072, DFB080~081, DFB090, DFB092, DFB110~111, DFB120~121, DFB123 |
 | **합계** | **61** | |
 
 ---
