@@ -2,7 +2,7 @@
 
 ## 개요
 
-`backward_slicer.py`(현재 버전)를 DataFlowBench 60개 케이스에 대해
+`backward_slicer.py`(현재 버전)를 DataFlowBench 61개 케이스에 대해
 코드 정적 분석으로 평가한 결과다. 실제 바이너리 실행 없이 슬라이서의
 PCode 처리 로직과 각 케이스의 데이터 흐름 패턴을 대조하여 판정했다.
 
@@ -111,17 +111,30 @@ dfbench_adapter 개발 시 `SOURCE_FUNCTIONS` 설정으로 해결 예정.
 | DFB045 | nested_aggregate_field | ⚠️ 불확실 | 중첩 struct 오프셋 누적 계산 — PTRADD 체인을 따라가는지 의존 |
 | DFB046 | partial_overwrite_subfield | ❌ FAIL | 부분 write 후 전체 read — PCode에서 별도 SSA 노드로 분리, 연결 추적 불가 |
 
-#### Offset Arithmetic (DFB034, DFB047 ~ DFB049)
+#### Offset Arithmetic / Bitfield (DFB034 ~ DFB035, DFB047 ~ DFB049)
 
 오프셋 단위 추적의 경계 케이스를 검증하는 신규 그룹.
 PTRSUB / INT_ADD / INT_SUB / SUBPIECE PCode 패턴과 슬라이서 한계 지점을 명시한다.
 
 | ID | 이름 | 판정 | 근거 |
 |---|---|:---:|---|
-| DFB034 | bitfield_access | ❌ FAIL | `unsigned flags:4; unsigned value:4` — SUBPIECE+INT_RIGHT+INT_AND 패턴. write 시 read-modify-write 바이트 병합으로 두 소스가 단일 STORE에 섞임. bit-range 분석 없이는 source_A / source_B 분리 불가 |
+| DFB034 | bitfield_access | ❌ FAIL | **실측 확인.** 비초기화 bp → Ghidra가 `CALL out=null + INDIRECT out=stack:0x-38` 패턴으로 인코딩. source 반환값 varnode가 없고, sink는 undefined stack varnode를 수신. 슬라이서가 INDIRECT의 effect_host(CALL seqno)를 따라가는 로직 없어 소스 전혀 미탐지 |
+| DFB035 | bitfield_access_zeroinit | ⚠️ 불확실 | DFB034와 동일 로직, `bp = {0}` 초기화만 다름. 가설: 초기화로 SSA 체인이 앵커되어 Ghidra가 source 반환값 varnode를 INDIRECT 출력에 연결할 수 있음. **실제 PCode 형태는 pcode_dumper 실행으로 확인 필요** |
 | DFB047 | struct_padding_offset | ✅ PASS | `char tag` + 3바이트 패딩 + `int value`. Ghidra decompiler가 ABI-correct 절대 오프셋(+4)을 계산해 PTRSUB에 직접 반영 → 슬라이서는 decompiler 제공 오프셋을 그대로 사용하므로 패딩 인식 불필요 |
 | DFB048 | cast_range_overlap | ❌ FAIL | `*(int*)(buf+4) = src_A` → STORE size=4, offset=4 (covers bytes [4..7]). 읽기는 `buf[6]`(offset=6, size=1). 정확한 추적을 위해 `store_offset ≤ read_offset < store_offset + store_size` range 교집합 검사 필요 → 현재 슬라이서 exact offset 매칭으로 미탐 |
 | DFB049 | negative_offset_arithmetic | ⚠️ 불확실 | `end = buf+30; *(end-10) = src`. 상수 피연산자 → Ghidra 상수 폴딩 시 INT_ADD(buf, 20) 단일 op → PASS. 비폴딩 시 INT_ADD(INT_ADD(buf, 30), -10) — INT_NEGATE/INT_2COMP 결합 필요 → FAIL |
+
+**DFB034 실측 PCode (Ghidra, 비초기화):**
+```
+CALL  out=null        in=[dfb_source_A]
+INDIRECT  out=stack:0x-38  in=[stack:0x-38, const:0xf]    ← effect_host=seqno(CALL)
+CALL  out=null        in=[dfb_source_B]
+INDIRECT  out=stack:0x-38  in=[stack:0x-38, const:0x43]
+CALL  out=null        in=[dfb_sink_int, stack:0x-38]
+```
+source 반환값 varnode가 생성되지 않으며, INDIRECT의 `const:seqno`가 원인 CALL을 가리키지만
+현재 슬라이서는 이 effect_host 역참조 로직이 없다.
+**→ 향후 개선 방향**: `INDIRECT` 처리 시 effect_host seqno로 원인 CALL을 찾아 callee를 SOURCE_FUNCTIONS에서 조회하는 경로 추가 (over-approximation으로 양쪽 source 모두 탐지하게 됨)
 
 #### Interprocedural (DFB050 ~ DFB060)
 
@@ -205,9 +218,9 @@ PTRSUB / INT_ADD / INT_SUB / SUBPIECE PCode 패턴과 슬라이서 한계 지점
 | 판정 | 개수 | 케이스 |
 |---|:---:|---|
 | ✅ PASS | **17** | DFB001~003, DFB010~012, DFB020~022, DFB040, DFB043, DFB047, DFB050~051, DFB054, DFB056, DFB058, DFB102, DFB200~201 |
-| ⚠️ 불확실 | **20** | DFB023~026, DFB030, DFB041~042, DFB045, DFB049, DFB052~053, DFB055, DFB057, DFB059~060, DFB073, DFB091, DFB100~101, DFB122, DFB130~131 |
+| ⚠️ 불확실 | **21** | DFB023~026, DFB030, DFB035, DFB041~042, DFB045, DFB049, DFB052~053, DFB055, DFB057, DFB059~060, DFB073, DFB091, DFB100~101, DFB122, DFB130~131 |
 | ❌ FAIL | **23** | DFB031~032, DFB034, DFB044, DFB046, DFB048, DFB070~072, DFB080~081, DFB090, DFB092, DFB110~111, DFB120~121, DFB123 |
-| **합계** | **60** | |
+| **합계** | **61** | |
 
 ---
 
@@ -243,6 +256,7 @@ PTRSUB / INT_ADD / INT_SUB / SUBPIECE PCode 패턴과 슬라이서 한계 지점
 ## 평가 기준 시점
 
 - 평가 대상: `backward_slicer.py` (08_tracing_Data_Origin, commit `eac4637` 기준)
-- 테스트베드: DataFlowBench v1.0 (09_tdo_testbed, 60 cases — offset arithmetic 그룹 DFB032/034/047~049 추가)
+- 테스트베드: DataFlowBench v1.0 (09_tdo_testbed, 61 cases — offset arithmetic 그룹 DFB032/034~035/047~049 추가)
+- DFB034 실측 PCode: Ghidra headless 덤프로 `CALL out=null + INDIRECT` 패턴 확인 (2026-06-10)
 - 평가 방법: 코드 정적 분석 (Ghidra headless 실행 없음)
 - 실측 검증: `dfbench_adapter.py` 완성 후 진행 예정
